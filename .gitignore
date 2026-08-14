@@ -20,3 +20,6 @@ phases/private/
 
 # macOS
 .DS_Store
+
+# bi mat cuc bo — khong bao gio commit
+.env

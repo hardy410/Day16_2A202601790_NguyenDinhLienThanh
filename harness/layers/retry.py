@@ -61,7 +61,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
+from arena.model import is_degraded
 
 from harness.middleware import Middleware
 
@@ -70,6 +70,15 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 #: Số lượt để dành cho `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
+
+#: Tổng số lần thử cho MỘT lượt gọi model, tính cả lần đầu.
+#:
+#: Vì sao lớp này cũng gác lượt gọi model: một lỗi giao vận nhất thời ở
+#: endpoint (đo được trên gpt-5.6-luna: `[SSL: TLSV1_ALERT_PROTOCOL_VERSION]`
+#: ở đúng một brief trong chín) ném exception xuyên qua `agent.run()`, runner
+#: ghi `error`, và brief đó về 0.00 — mất trọn 100 điểm vì một cái chớp mạng.
+#: Đây đúng là việc của §7: hỏng nhất thời thì thử lại, ở tầng dưới mô hình.
+DEFAULT_MAX_MODEL_ATTEMPTS = 3
 
 
 class Retry(Middleware):
@@ -81,21 +90,65 @@ class Retry(Middleware):
         self,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         reserve: int = DEFAULT_RESERVE,
+        max_model_attempts: int = DEFAULT_MAX_MODEL_ATTEMPTS,
     ) -> None:
         self.max_attempts = max(1, int(max_attempts))
         self.reserve = max(0, int(reserve))
+        self.max_model_attempts = max(1, int(max_model_attempts))
+
+    def wrap_model_call(self, ctx, call, messages):
+        """Gọi lại một lượt model chết vì lỗi giao vận nhất thời.
+
+        KHÔNG PHẢI "nuốt lỗi" theo nghĩa README §3 cấm: hết số lần thử thì
+        exception được NÉM LẠI nguyên vẹn, nên một lỗi cấu hình thật (sai
+        key, sai base_url, model không tồn tại) vẫn làm cả lượt chạy gãy to
+        tiếng ngay lần đầu như cũ. Chỉ những lỗi tự khỏi khi gọi lại mới
+        được cứu.
+
+        `except Exception` chứ không phải `except BaseException`: runner cố
+        tình cho `RunAborted` thừa kế `BaseException` để không lớp nào chặn
+        được lệnh dừng của nó (trần thời gian, trần số lượt gọi).
+        """
+        attempts = 1
+        while True:
+            try:
+                return call(messages)
+            except Exception:
+                if attempts >= self.max_model_attempts:
+                    ctx.state["model_call_gave_up"] = (
+                        ctx.state.get("model_call_gave_up", 0) + 1
+                    )
+                    raise
+                ctx.state["model_retries"] = ctx.state.get("model_retries", 0) + 1
+                attempts += 1
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§7): khoảng 8-12 dòng.
-        #  1. Trong khi số lần đã thử < self.max_attempts VÀ kết quả còn
-        #     hỏng — tức `(not result.ok) or is_degraded(result.content)` —
-        #     thì gọi lại `call(name, args)` với ĐÚNG name/args cũ.
-        #  2. DỪNG THỬ LẠI khi ngân sách đã cạn: nếu
-        #     `ctx.max_tool_calls` khác None và
-        #     `ctx.tools.calls >= ctx.max_tool_calls - self.reserve`
-        #     thì đừng gọi thêm lượt nào nữa (xem phần cảnh báo ở trên).
-        #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
-        #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
-        #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+        while attempts < self.max_attempts and self._broken(result):
+            if self._out_of_budget(ctx):
+                # Gọi thêm là tiêu vào lượt dành cho `submit`. Thà trả về
+                # kết quả hỏng: agent vẫn chốt được FINAL.
+                ctx.state["retry_budget_stops"] = ctx.state.get("retry_budget_stops", 0) + 1
+                break
+            result = call(name, args)  # ĐÚNG name/args cũ: lượt gọi mới -> tung xúc xắc mới
+            attempts += 1
+        ctx.state["retry_attempts"] = ctx.state.get("retry_attempts", 0) + attempts - 1
+        if self._broken(result):
+            ctx.state["retry_gave_up"] = ctx.state.get("retry_gave_up", 0) + 1
+        return result
+
+    # -- hai điều kiện, tách ra cho đọc được ---------------------------
+
+    @staticmethod
+    def _broken(result) -> bool:
+        """`ok=True` KHÔNG có nghĩa là ổn: bản bị cắt và bản nhiễu đều về
+        với `ok=True`, nên phải hỏi cả `is_degraded`."""
+        if result is None or not hasattr(result, "ok"):
+            return False
+        content = result.content if isinstance(result.content, str) else ""
+        return (not result.ok) or is_degraded(content)
+
+    def _out_of_budget(self, ctx) -> bool:
+        limit = ctx.max_tool_calls
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
