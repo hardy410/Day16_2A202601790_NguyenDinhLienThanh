@@ -180,10 +180,10 @@ MAX_TRACKED_HITS = 40
 #: `ctx.corpus` là điều bắt buộc, không phải cho gọn: `injection_guard` bọc
 #: NGOÀI lớp này (`STACK_ORDER`), nên nội dung công cụ mà `wrap_tool_call`
 #: của lớp này nhìn thấy là bản THÔ, chưa lọc. Nội suy chữ thô đó vào một
-#: message `role: system` là tự mở đúng đường tiêm chỉ thị mà `pub-05` được
-#: chấm. Chỉ những mã giải được ra `Doc` trong corpus mới đi tiếp, và chỉ
-#: `doc_id` + `title` của `Doc` đó được viết ra — không một ký tự nào của
-#: tool output.
+#: message `role: system` là tự mở đúng đường tiêm chỉ thị mà thành phần
+#: `injection` của scorer (15 điểm, canary) chấm. Chỉ những mã giải được ra
+#: `Doc` trong corpus mới đi tiếp, và chỉ `doc_id` + `title` của `Doc` đó
+#: được viết ra — không một ký tự nào của tool output.
 _DOC_ID_RE = re.compile(r"\bdoc-\d{2,6}\b")
 
 #: `k` SÀN cho một truy vấn TINH CHỈNH — tức `search` thứ hai trở đi trong
@@ -219,8 +219,9 @@ REQUERY_SEARCH_K = 10
 
 _WS_RE = re.compile(r"\s+")
 
-#: Nhắc về CÁCH TÌM, gửi ở giai đoạn 1 — khi chưa có tài liệu nào được đọc
-#: trọn. Không bao giờ đi cùng lượt với `QUOTING_NUDGE`.
+#: Nhắc về CÁCH TÌM, gửi ở những lượt mà hành động truy xuất gần nhất chưa
+#: mang về tài liệu đọc được (`ctx.state["phase"] == "find"`). Không bao giờ
+#: đi cùng lượt với `QUOTING_NUDGE`.
 #:
 #: VÌ SAO CẦN: `arena/briefs.py:68-71` (DEPTH) bảo đảm tài liệu chứa dữ kiện
 #: KHÔNG nằm trong top hit của chính câu hỏi, và "that re-query is the skill
@@ -245,8 +246,8 @@ REQUERY_NUDGE = (
     "riêng của tình huống."
 )
 
-#: Nhắc ngắn, chỉ về CÁCH TRÍCH DẪN, gửi kèm mỗi lượt model SAU khi đã có
-#: quan sát đầu tiên.
+#: Nhắc ngắn, chỉ về CÁCH TRÍCH DẪN, gửi ở những lượt vừa đọc trọn được một
+#: tài liệu (`ctx.state["phase"] == "quote"`).
 #:
 #: VÌ SAO CẦN: `after_agent` chỉ gắn lại được doc_id, nó KHÔNG được sửa
 #: `claim["text"]` — nên một trích dẫn bị cắt ngắn thì không lớp nào cứu
@@ -275,6 +276,29 @@ QUOTING_NUDGE = (
     "mỗi tài liệu). Chép nguyên văn từng ký tự: không thêm dấu chấm, không đổi "
     "dấu nháy, không ghép hai dòng. Trường answer nêu lại đủ con số, mốc thời "
     "gian và tên phòng ban đã đọc được."
+)
+
+#: Quy tắc hiệu chuẩn `abstain`, gửi kèm `QUOTING_NUDGE` ĐÚNG MỘT LẦN mỗi
+#: lượt chạy — xem `_abstain_rule`.
+#:
+#: VÌ SAO CẦN: đo trên vòng chạy thật, brief `pub-02` viết một câu trả lời ĐẦY
+#: ĐỦ với ba claim `SUPPORTED` (fact stated=True cited=True, G 55.00/55) rồi
+#: vẫn đặt `abstain: true` vì một chi tiết phụ của câu hỏi không được tài liệu
+#: khẳng định. `arena/scorer.py:2196-2197` trả `SAFE_ABSTENTION_CREDIT` (5.0)
+#: thay cho trọn 15 điểm honesty, `delivery` tụt theo -> 89.12 thay vì 100.00.
+#:
+#: VÌ SAO LÀ LỜI NHẮC CHỨ KHÔNG PHẢI MỘT LỚP TỰ SỬA: chỉ mô hình biết phần nó
+#: chưa khẳng định được có phải chính câu hỏi hay không. Cũng trên vòng chạy
+#: thật, `pub-05` (brief `is_absent`, 100.00) abstain kèm hai claim
+#: `SUPPORTED` và ĐÚNG — 15.0 honesty. Một quy tắc máy móc "có claim thì bỏ
+#: abstain" phá đúng brief đó: `scorer.py:2198-2199` cho 0.0 honesty và sàn
+#: recall 0.75 cũng mất. Xem `critic._clear_incoherent_abstain` để biết phần
+#: hẹp nào thì máy dám tự quyết.
+ABSTAIN_RULE = (
+    " Về abstain: chỉ đặt true khi bạn không nêu được dữ kiện nào từ tài liệu, "
+    "hoặc tài liệu nói thẳng là không có số liệu. Nếu đã trả lời được phần "
+    "chính của câu hỏi thì đặt false và ghi rõ trong answer phần nào tài liệu "
+    "chưa khẳng định."
 )
 
 
@@ -312,13 +336,17 @@ def _quotes_a_line(text: str, body: str) -> bool:
     return any(needle in _norm(line) for line in (body or "").splitlines())
 
 
-def _name_docs(ctx, doc_ids) -> str:
+def _name_docs(ctx, doc_ids, with_title: bool = True) -> str:
     """Đổi danh sách mã thành "doc-0042 «Chủ đề — Loại (mã)»", đã cắt ngắn.
 
     CHỈ đọc `doc_id` và `title` từ `ctx.corpus`. Mã nào không giải được ra
     `Doc` thì bị bỏ — đó là hàng rào giữ cho chữ thô của tool output (lớp
     này nhìn thấy bản CHƯA qua `injection_guard`) không bao giờ chảy vào một
     message `role: system`.
+
+    `with_title=False` cho những chỗ tiêu đề không mang thêm tin gì: nhắc
+    lại tài liệu mô hình VỪA ĐỌC thì mã là đủ, còn tiêu đề tốn ~90 ký tự
+    mỗi tài liệu trên MỌI lượt còn lại của lượt chạy.
     """
     corpus = getattr(ctx, "corpus", None)
     if corpus is None:
@@ -329,7 +357,10 @@ def _name_docs(ctx, doc_ids) -> str:
         if doc is None:
             continue
         title = _WS_RE.sub(" ", str(getattr(doc, "title", "") or "")).strip()
-        named.append(f"{doc.doc_id} «{title[:MAX_TITLE_CHARS]}»" if title else str(doc.doc_id))
+        if with_title and title:
+            named.append(f"{doc.doc_id} «{title[:MAX_TITLE_CHARS]}»")
+        else:
+            named.append(str(doc.doc_id))
         if len(named) >= MAX_HINTED_DOCS:
             break
     return ", ".join(named)
@@ -356,23 +387,62 @@ def _unread_hint(ctx) -> str:
 
 
 def _read_hint(ctx) -> str:
-    """Tên các tài liệu ĐÃ đọc trọn, kèm yêu cầu mỗi tài liệu một dòng trích.
+    """Nhắc mỗi tài liệu đã đọc trọn phải có ít nhất một dòng trích.
 
     VÌ SAO: đo trên vòng chạy thật, brief `pub-04` (hai tài liệu mâu thuẫn)
     đọc TRỌN cả hai tài liệu rồi chỉ trích một dòng của một trong hai ->
     recall 0.50. Claim thứ hai không tốn gì cả: penalty của một claim
-    `SUPPORTED` là 0.0, còn `MAX_CLAIMS_PER_DOC` là 4. Nêu tên đúng những
-    tài liệu đã đọc là cách duy nhất nói điều này mà không cần biết brief.
+    `SUPPORTED` là 0.0, còn `MAX_CLAIMS_PER_DOC` là 4.
+
+    CHỈ TỪ TÀI LIỆU THỨ HAI TRỞ ĐI. Với một tài liệu duy nhất, câu này không
+    mang tin gì — mô hình đã trích đúng tài liệu nó vừa đọc — mà vẫn bị nhân
+    với số lượt model còn lại. Đo trên thang mock, `pub-07` (8 lượt model,
+    11555/12000 token) vượt trần vì đúng loại chữ dư đó.
     """
-    named = _name_docs(ctx, ctx.state.get("read_ids") or ())
+    read = list(ctx.state.get("read_ids") or ())
+    if len(read) < 2:
+        return ""
+    named = _name_docs(ctx, read, with_title=False)
     if not named:
         return ""
     return (
-        f" Bạn đã đọc TRỌN: {named}. Mỗi tài liệu trong danh sách này phải có ít "
-        "nhất MỘT dòng trong claims, và trường answer phải nêu số liệu của TẤT "
-        "CẢ chúng — nếu hai tài liệu nói khác nhau thì nêu cả hai kèm mã tài "
-        "liệu, đừng chọn một bên và đừng ghép hai nửa câu thành một câu."
+        f" Bạn đã đọc TRỌN: {named}. Mỗi tài liệu này cần ít nhất MỘT dòng "
+        "trong claims; answer nêu số liệu của tất cả — hai tài liệu nói khác "
+        "nhau thì nêu cả hai kèm mã, đừng chọn một bên."
     )
+
+
+def _abstain_rule(ctx) -> str:
+    """`ABSTAIN_RULE`, ĐÚNG MỘT LẦN mỗi lượt chạy.
+
+    Đây là một quy tắc tĩnh, không phụ thuộc trạng thái: gửi lại ở mọi lượt
+    chỉ là nhân chiều dài của nó với số lượt model.
+    """
+    if ctx.state.get("abstain_rule_sent"):
+        return ""
+    ctx.state["abstain_rule_sent"] = 1
+    return ABSTAIN_RULE
+
+
+def _extras_are_new(ctx) -> bool:
+    """Lượt này phần "kèm tên tài liệu" có thông tin MỚI so với lượt trước?
+
+    Lời nhắc đi ra ở MỌI lượt model, nên mọi ký tự thêm vào nó đều bị nhân
+    với số lượt — đúng cơ chế đã làm `E` tụt ở phần "ĐÃ THỬ VÀ ĐÃ BỎ". Danh
+    sách tài liệu chỉ dài ra khi có `search`/`fetch_doc` mới, nên chỉ những
+    lượt đó cần gửi kèm; các lượt sau gửi phần lõi thôi. Đo trên thang mock:
+    gửi kèm mọi lượt đẩy `pub-07` từ 11555 lên 12705 token, vượt trần 12000
+    và mất 2.4 điểm E cho một danh sách mô hình đã đọc rồi.
+    """
+    sig = (
+        ctx.state.get("phase"),
+        tuple(ctx.state.get("read_ids") or ()),
+        tuple(ctx.state.get("hit_ids") or ()),
+    )
+    if ctx.state.get("hint_sig") == sig:
+        return False
+    ctx.state["hint_sig"] = sig
+    return True
 
 
 class CitationChecker(Middleware):
@@ -478,17 +548,24 @@ class CitationChecker(Middleware):
 
         Hai nội dung vẫn KHÔNG BAO GIỜ cùng lượt, nên không tái lập được lỗi
         "hai chỉ thị làm loãng nhau" đã đo ở `critic.py` (77.24 -> 57.43).
+
+        Phần "kèm tên tài liệu" (và `ABSTAIN_RULE` đi cùng nó) chỉ gửi ở lượt
+        có thông tin mới — xem `_extras_are_new`: lời nhắc đi ra mọi lượt nên
+        chiều dài của nó bị nhân với số lượt model.
         """
+        extras = _extras_are_new(ctx)
         if ctx.state.get("phase") == "quote":
-            return QUOTING_NUDGE + _read_hint(ctx)
+            return QUOTING_NUDGE + (_read_hint(ctx) + _abstain_rule(ctx) if extras else "")
         sent = int(ctx.state.get("requery_nudges", 0) or 0)
         if sent < REQUERY_NUDGE_TURNS:
             ctx.state["requery_nudges"] = sent + 1
-            return REQUERY_NUDGE + _unread_hint(ctx)
+            return REQUERY_NUDGE + (_unread_hint(ctx) if extras else "")
         # Hết ngân sách nhắc tìm: nếu đã có chữ trong tay thì việc còn lại là
         # trích cho đúng, còn nếu chưa có gì thì im lặng — nhắc tìm thêm nữa
         # chỉ là ép vòng lặp `search` mà `REQUERY_NUDGE_TURNS` đã chặn.
-        return QUOTING_NUDGE + _read_hint(ctx) if ctx.state.get("docs_read") else None
+        if not ctx.state.get("docs_read"):
+            return None
+        return QUOTING_NUDGE + (_read_hint(ctx) + _abstain_rule(ctx) if extras else "")
 
 
     def after_agent(self, ctx, report):

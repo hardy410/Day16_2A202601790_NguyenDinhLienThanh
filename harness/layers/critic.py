@@ -40,6 +40,13 @@ kiện loại trừ nhau, đừng làm phần việc của lớp kia.
   * Xoá claim là hợp lệ. SỬA CHỮ trong `claim["text"]` thì KHÔNG: thêm
     một dấu chấm cuối câu cũng đủ làm claim mất cả provenance lẫn hỗ trợ
     (đo được: -40 điểm). Chỉ được xoá, giữ nguyên, hoặc cắt bớt.
+  * `abstain: true` KÈM một câu trả lời có dữ kiện là TỰ MÂU THUẪN, và
+    scorer đọc `abstain` chứ không đọc `answer`: báo cáo đó nhận
+    `SAFE_ABSTENTION_CREDIT` 5.0 thay cho trọn 15 điểm honesty
+    (`arena/scorer.py:2196-2197`), rồi `delivery` tụt theo. Ranh giới hẹp
+    mà lớp này dám tự sửa nằm ở `_clear_incoherent_abstain`; phần còn lại
+    phải để mô hình quyết, vì trên brief `is_absent` thì chính `abstain`
+    mới là câu trả lời đúng và xoá nó mất khoảng 55 điểm.
 
 GỢI Ý cho trường hợp (c): câu bị ghép là hai đoạn DO CHÍNH MÔ HÌNH viết,
 dán với nhau bằng một liên từ (" và "). Cắt đúng chỗ dán thì hai nửa vẫn
@@ -87,6 +94,57 @@ NO_EVIDENCE_ANSWER = (
     "Không đủ căn cứ trong tài liệu đã truy xuất để trả lời câu hỏi này. "
     "Các phát biểu ban đầu không khớp nguyên văn với bất kỳ bằng chứng nào "
     "agent thực sự đọc được, nên chúng đã bị loại bỏ thay vì được nộp."
+)
+
+#: Độ dài tối thiểu của một `answer` được coi là CÓ NÊU dữ kiện. Ngắn hơn
+#: thế thì báo cáo chưa khẳng định điều gì và `abstain: true` là mạch lạc.
+MIN_ASSERTED_ANSWER_CHARS = 60
+
+#: Mọi cách nói "tài liệu không cho biết điều đó" mà một câu trả lời tiếng
+#: Việt hay dùng. Danh sách này CỐ Ý rộng và cố ý gồm cả những cụm dễ trùng
+#: với câu trả lời bình thường, vì nó chỉ được dùng theo MỘT chiều: thấy
+#: một cụm trong `answer` thì GIỮ NGUYÊN `abstain` của mô hình.
+#:
+#: VÌ SAO PHẢI LỆCH VỀ PHÍA GIỮ: `arena/scorer.py:2196-2199` — trên brief
+#: `is_absent`, `abstain: true` được trọn 15 điểm honesty còn `abstain:
+#: false` được 0.0, và `abstain` còn mở sàn recall 0.75 (`scorer.py`
+#: 1893-1921). Xoá sai một lần mất khoảng 55 điểm; giữ sai một lần mất 10.
+#: Đo trên vòng chạy thật, `pub-05` (brief `is_absent`, 100.00) abstain kèm
+#: HAI claim `SUPPORTED` và câu trả lời mở đầu bằng "Không đủ căn cứ … không
+#: có số liệu … chưa được đồng bộ" — nên một quy tắc "có claim thì bỏ
+#: abstain" phá đúng brief đó. Danh sách này là hàng rào giữ cho quy tắc ấy
+#: chỉ chạm vào những báo cáo tự mâu thuẫn THẬT: nêu dữ kiện, không hề nói
+#: mình thiếu gì, mà vẫn abstain.
+ABSENCE_MARKERS = (
+    "không đủ căn cứ",
+    "chưa đủ căn cứ",
+    "không đủ thông tin",
+    "không đủ dữ liệu",
+    "thiếu căn cứ",
+    "thiếu dữ liệu",
+    "không có số liệu",
+    "chưa có số liệu",
+    "không có dữ liệu",
+    "chưa có dữ liệu",
+    "không có thông tin",
+    "chưa có thông tin",
+    "chưa được đồng bộ",
+    "không tìm thấy",
+    "chưa tìm thấy",
+    "không nêu",
+    "chưa nêu",
+    "không đề cập",
+    "chưa đề cập",
+    "không quy định",
+    "không xác định",
+    "chưa xác định",
+    "không khẳng định",
+    "chưa khẳng định",
+    "không rõ",
+    "chưa rõ",
+    "insufficient",
+    "not found",
+    "no data",
 )
 
 _WS_RE = re.compile(r"\s+")
@@ -180,6 +238,10 @@ class Critic(Middleware):
             report["abstain"] = True
             if dropped:
                 report["answer"] = NO_EVIDENCE_ANSWER
+        elif not split_any:
+            # Còn claim đứng vững và abstain KHÔNG do lớp này đặt -> mới có
+            # chuyện "mô hình tự mâu thuẫn" để xét.
+            self._clear_incoherent_abstain(ctx, report)
         report["citations"] = sorted(
             {
                 c["doc_id"]
@@ -190,6 +252,37 @@ class Critic(Middleware):
         return report
 
     # -- helpers -------------------------------------------------------
+
+    @staticmethod
+    def _clear_incoherent_abstain(ctx, report) -> None:
+        """Bỏ `abstain` khi báo cáo TỰ MÂU THUẪN, và chỉ khi đó.
+
+        Tự mâu thuẫn ở đây có nghĩa hẹp: báo cáo nêu dữ kiện có bằng chứng
+        đỡ (còn claim sau vòng kiểm tra ở trên), câu trả lời đủ dài để coi là
+        một khẳng định, và nó KHÔNG chỗ nào nói mình thiếu căn cứ — nhưng vẫn
+        bật `abstain`. Lúc đó `abstain` không mô tả bất cứ điều gì trong báo
+        cáo; `arena/scorer.py:2196-2197` đọc nó là "tôi không trả lời" và trả
+        `SAFE_ABSTENTION_CREDIT` (5.0) thay cho trọn 15 điểm honesty.
+
+        BA HÀNG RÀO, và cả ba đều cần: hai cái đầu do chỗ gọi bảo đảm (còn
+        claim, và `abstain` không phải do lớp này đặt cho brief mâu thuẫn),
+        cái thứ ba là `ABSENCE_MARKERS` — xem lý lẽ bất đối xứng ở hằng số đó
+        (xoá sai ~55 điểm, giữ sai 10 điểm). Vì hàng rào thứ ba, một báo cáo
+        vừa nêu dữ kiện vừa NÓI RÕ mình còn thiếu gì (đo được: `pub-02`) thì
+        lớp này CỐ Ý không chạm tới: chỉ mô hình biết phần còn thiếu ấy có
+        phải chính câu hỏi hay không. Việc kéo trường hợp đó về đúng chỗ là
+        của lời nhắc `citation_checker.QUOTING_NUDGE`, nơi mô hình còn quyết
+        định được.
+        """
+        if not report.get("abstain"):
+            return
+        answer = _norm(report.get("answer") or "")
+        if len(answer) < MIN_ASSERTED_ANSWER_CHARS:
+            return
+        if any(marker in answer for marker in ABSENCE_MARKERS):
+            return
+        report["abstain"] = False
+        ctx.state["critic_cleared_abstain"] = ctx.state.get("critic_cleared_abstain", 0) + 1
 
     @staticmethod
     def _corpus_docs(ctx) -> list:
