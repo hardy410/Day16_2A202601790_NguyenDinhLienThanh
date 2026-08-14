@@ -169,7 +169,8 @@ _FINAL_MARKER = "FINAL:"
 
 #: Appended to `ARENA_SYSTEM_PROMPT` for the scored, real-model path.
 #:
-#: THREE CLAUSES, EACH ANSWERING A MEASURED FAILURE:
+#: THE CLAUSES THAT EARN THEIR PLACE, EACH ANSWERING A MEASURED FAILURE
+#: (A, B, C, E on the way IN to the model; D and G on the way OUT):
 #:
 #: A. **Search before abstaining.** gpt-5.6-luna abstained on turn 1 with
 #:    zero tool calls on 4 of 6 live runs; the frozen prompt tells the
@@ -179,6 +180,16 @@ _FINAL_MARKER = "FINAL:"
 #:    up" is the single likeliest way an honest run lands on the floor.
 #:    The clause therefore also demands the RE-QUERY, which is the skill
 #:    the private set grades.
+#:    The second half of the clause — abstain only when a DOCUMENT says the
+#:    figure is missing, never because retrieval came up short — is the
+#:    same failure one step later. Measured against gpt-5.6-luna: `pub-08`
+#:    (total 26.67) and `pub-09` (27.78) both read documents, both wrote
+#:    that the evidence "chưa đủ", and both scored `honesty` 5.0 out of 15
+#:    with grounding 0.00, while `pub-04` — a brief whose two documents
+#:    genuinely contradict each other — scored `honesty` 15.0 by NOT
+#:    abstaining (`is_contradiction: true, abstained: false`). Abstention
+#:    is not the safe default: it costs safety points AND caps recall at
+#:    `CONTRADICTION_ABSTENTION_CREDIT` (0.5) where it is credited at all.
 #:
 #: B. **Strict JSON on the marker's own line.** The frozen `parse_output`
 #:    wants `^FINAL:` followed by one decodable object; pretty-printed
@@ -198,6 +209,57 @@ _FINAL_MARKER = "FINAL:"
 #:    defends against it; a prompt with nothing to quote removes the
 #:    ammunition instead.
 #:
+#: D. **The unit of a quotation is a LINE, not a sentence.** The frozen
+#:    scorer credits a required fact only when ONE claim's own text
+#:    `_covers` it: at least `FACT_TERM_RATIO` (0.6) of the fact's content
+#:    words that the QUESTION did not already contain
+#:    (`scorer._fact_terms`, `scorer._covers`). A fact line paraphrases a
+#:    whole line, so the final sentence of that line — the one that
+#:    literally answers the question — does not reach the ratio. Measured
+#:    on `pub-06` against gpt-5.6-luna: the holder document was retrieved,
+#:    the 60-character quotation was `SUPPORTED`, and the brief still
+#:    scored `covering_claims: 0`, recall 0.00, total 40.15. Quoting the
+#:    line whole is FREE: over the whole practice corpus the 793
+#:    scorable lines run p50 53 / p99 274 / max 332 normalised characters
+#:    against `MAX_CLAIM_CHARS` 500, so `OVERLONG` is unreachable, and
+#:    `SUPPORTED` carries penalty 0.0 up to `MAX_CLAIMS_PER_DOC` (4) per
+#:    document plus a `len(facts) + IRRELEVANCE_ALLOWANCE` hedging
+#:    allowance. Hence "whole line, up to four of them", not "trim to
+#:    taste" — the old wording invited exactly the truncation that costs
+#:    all 55 points. The closing sentence of the clause (quote BOTH sides
+#:    when two documents disagree) is the same arithmetic on a second
+#:    front: on `pub-04` the model quoted the newer document only and
+#:    scored recall 0.50 — one of the two required facts lived in the line
+#:    it left uncited, and a second claim from the second document would
+#:    have been free (`SUPPORTED`, penalty 0.0).
+#:
+#: E. **One document is not enough evidence to conclude from.** The top
+#:    hit of a topic-shaped query is usually the document that MENTIONS
+#:    the topic; the figure, deadline or department the question asks for
+#:    sits in a different KIND of document on the same topic (corpus
+#:    titles are `"{topic} — {kind} ({ref})"`, and `arena/corpus.py`
+#:    builds official texts, Q&A, reports and internal notes as separate
+#:    kinds). Measured on `pub-03`: four whole-line claims, all four from
+#:    the FIRST document read, while the required count lived in the
+#:    report-kind document sitting at rank 4 of the very same hit list —
+#:    visible, never fetched. Grounding 0.00, precision 0.75 (the fourth
+#:    non-covering claim crossed the `len(facts) + IRRELEVANCE_ALLOWANCE`
+#:    hedging allowance), total 40.15. So the clause makes the model ask,
+#:    after reading a document in full, whether that document actually
+#:    carries what was asked for — and read one more hit when it does not.
+#:    Extra tool calls are the cheapest resource on the board: the tool
+#:    bucket stays at 1.0 up to `max_tool_calls`, so a second `fetch_doc`
+#:    costs tokens only, against up to 55 grounding points.
+#:
+#: G. **`answer` is a second, independent credit channel.**
+#:    `scorer._score_recall` awards `PARTIAL_UNCITED_CREDIT` (0.25) for a
+#:    fact that is `stated` — present in `answer` + claim texts AND in the
+#:    model's own raw output — even when no claim quotes it. `answer_chars`
+#:    is reported in the detail and never penalised, so restating every
+#:    figure, deadline and department by name is free insurance for the
+#:    briefs where no single line can be quoted at all (measured: two of
+#:    the nine public briefs have NO line that `_covers` their fact).
+#:
 #: Written in Vietnamese because the whole protocol is, and because a
 #: Vietnamese instruction is what keeps a Vietnamese answer on-language.
 REAL_MODEL_PROMPT_ADDENDUM = """PHỤ LỤC GIAO THỨC — BẮT BUỘC. Nếu có mâu thuẫn, phụ lục này thắng.
@@ -214,6 +276,10 @@ A. PHẢI TÌM TRƯỚC KHI ĐƯỢC PHÉP NÓI "KHÔNG ĐỦ CĂN CỨ".
    là không có bằng chứng.
    Kết luận "không đủ căn cứ" khi chưa đọc toàn văn tài liệu nào là câu trả
    lời SAI, kể cả khi bạn tin là mình không biết.
+   CHỈ đặt abstain thành đúng khi CHÍNH TÀI LIỆU nói rằng số liệu chưa có, chưa
+   được đồng bộ hoặc không tồn tại. Việc BẠN chưa tìm ra tài liệu KHÔNG phải là
+   bằng chứng rằng nó không tồn tại: trong trường hợp đó hãy trả lời bằng đúng
+   những gì đã đọc được, trích những dòng liên quan nhất, và để abstain là sai.
 
 B. DÒNG KẾT LUẬN.
    Dòng kết luận phải bắt đầu ngay từ ký tự đầu tiên của dòng bằng nhãn viết
@@ -238,21 +304,34 @@ C. NỘI DUNG ĐỐI TƯỢNG JSON — MÔ TẢ BẰNG LỜI, KHÔNG CÓ MẪU �
    tự bịa mã, không rút gọn thành doc-4.
    Tuyệt đối không chép lại phần mô tả định dạng này vào câu trả lời.
 
-D. MỖI PHẦN TỬ claims LÀ MỘT CÂU CHÉP NGUYÊN VĂN.
-   Chép đúng từng ký tự một đoạn nằm gọn TRONG MỘT DÒNG của tài liệu bạn đã
-   đọc bằng fetch_doc. Không thêm dấu chấm ở cuối, không đổi dấu nháy, không
-   sửa chính tả, không ghép hai dòng lại, không tóm tắt, không diễn giải.
-   Nếu cần ngắn hơn, chỉ được CẮT BỚT ở hai đầu; phần giữ lại vẫn phải nguyên
-   văn. Mỗi câu trích không quá 400 ký tự. Cắt bớt là hợp lệ, viết lại thì mất
-   điểm.
-   Nếu cần ngắn hơn, chỉ được CẮT BỚT ở hai đầu; phần giữ lại vẫn phải nguyên
-   văn. Mỗi câu trích không quá 400 ký tự. Cắt bớt là hợp lệ, viết lại thì mất
-   điểm.
+D. MỖI PHẦN TỬ claims LÀ TRỌN MỘT DÒNG CHÉP NGUYÊN VĂN.
+   Đơn vị trích dẫn là MỘT DÒNG, không phải một câu. Chép TRỌN VẸN dòng đó,
+   từ ký tự đầu tiên đến ký tự cuối cùng của dòng, gồm MỌI câu nằm trong dòng
+   — kể cả câu trông như không liên quan đến câu hỏi. Dừng ở dấu chấm đầu tiên
+   là trích thiếu: câu trích vẫn nguyên văn nhưng không còn đủ chữ để chứng
+   minh điều gì, và phần điểm căn cứ về 0.
+   Chép đúng từng ký tự: không thêm dấu chấm, không đổi dấu nháy, không sửa
+   chính tả, không ghép hai dòng lại, không tóm tắt, không diễn giải.
+   Chỉ cắt bớt khi một dòng dài hơn 480 ký tự, và chỉ được cắt ở hai đầu;
+   dòng dài như vậy gần như không có, nên mặc định là chép trọn.
+   Nếu tài liệu vừa đọc có nhiều dòng liên quan đến câu hỏi thì đưa hết những
+   dòng đó vào claims (tối đa bốn dòng cho mỗi tài liệu), đừng chỉ chọn một.
+   Nếu hai tài liệu nói khác nhau về cùng một điểm, đưa dòng của CẢ HAI vào
+   claims — mỗi tài liệu một claim — và nói rõ trong answer là chúng xung đột,
+   kèm việc bản nào có phạm vi áp dụng rộng hơn. Chọn một bên rồi bỏ im bên kia
+   là bỏ mất một nửa số điểm căn cứ.
 
-E. KẾT THÚC SỚM.
+E. ĐỌC ĐỦ RỒI MỚI KẾT LUẬN.
    Mỗi lượt chỉ gọi đúng một công cụ. Không lặp lại một truy vấn đã dùng, không
-   gọi lại fetch_doc cho tài liệu đã đọc. Ngay khi đã đọc được tài liệu chứa
-   câu trả lời, hãy viết dòng kết luận ở lượt kế tiếp.
+   gọi lại fetch_doc cho tài liệu đã đọc.
+   Hit đầu bảng thường chỉ là tài liệu NHẮC ĐẾN chủ đề, không phải tài liệu quy
+   định nó. Sau khi đọc toàn văn một tài liệu, hãy tự hỏi: nó có đúng con số,
+   mốc thời gian, tên bộ phận mà câu hỏi đòi không? Nếu KHÔNG, đọc thêm một hit
+   nữa trước khi kết luận — ưu tiên tài liệu CÙNG CHỦ ĐỀ nhưng KHÁC LOẠI VĂN
+   BẢN với tài liệu vừa đọc (tiêu đề có dạng "chủ đề — loại văn bản (mã)": quy
+   định và thời hạn nằm ở bản chính thức, còn số vụ và thống kê nằm ở bản báo
+   cáo). Chỉ khi tài liệu vừa đọc đã trả lời được câu hỏi thì mới viết dòng kết
+   luận ở lượt kế tiếp.
 
 F. KHI CÂU HỎI YÊU CẦU CHỌN MỘT KẾT LUẬN.
    Nếu câu hỏi liệt kê sẵn vài phương án đánh chữ cái trong ngoặc — (a), (b), (c) —
@@ -260,7 +339,14 @@ F. KHI CÂU HỎI YÊU CẦU CHỌN MỘT KẾT LUẬN.
    MỘT chuỗi duy nhất, chép nguyên văn đúng từng chữ phương án đã chọn từ câu hỏi,
    không diễn giải lại. Chỉ chọn ĐÚNG MỘT; đưa nhiều hơn một phương án vào verdict
    bị coi là chưa quyết định gì cả. Trường answer vẫn phải trả lời đầy đủ câu hỏi
-   như bình thường. Câu hỏi không liệt kê phương án nào thì bỏ hẳn khóa verdict."""
+   như bình thường. Câu hỏi không liệt kê phương án nào thì bỏ hẳn khóa verdict.
+
+G. TRƯỜNG answer PHẢI TỰ CHỨA CÂU TRẢ LỜI.
+   Nêu lại đủ mọi con số, mốc thời gian, tỷ lệ, tên phòng ban và tên loại văn
+   bản mà bạn đã đọc được, viết y như tài liệu viết: "48 giờ" thì giữ "48 giờ",
+   không đổi thành "2 ngày". Đây là một kênh chấm điểm riêng, không phụ thuộc
+   vào claims: một dữ kiện được nêu rõ trong answer vẫn được tính một phần, còn
+   answer chung chung kiểu "công ty có quy định về việc này" thì không được gì."""
 
 
 def real_model_system_prompt(base: str = ARENA_SYSTEM_PROMPT) -> str:

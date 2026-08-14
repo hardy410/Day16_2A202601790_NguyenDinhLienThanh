@@ -90,11 +90,32 @@ nó không phải là bỏ hẳn việc nhắc diễn đạt lại truy vấn (�
 DUY NHẤT được chấm trên vòng kín), mà là để hai nội dung KHÔNG BAO GIỜ
 xuất hiện cùng lượt:
 
-    chưa đọc trọn tài liệu nào  -> `REQUERY_NUDGE` (tìm cho đúng)
-    đã đọc trọn một tài liệu    -> `QUOTING_NUDGE` (trích cho đúng)
+    hành động truy xuất gần nhất chưa mang về chữ -> `REQUERY_NUDGE`
+    (tìm cho đúng), kèm tên những hit còn bỏ dở
 
-Trạng thái đó lấy từ `wrap_tool_call` của chính lớp này: một lượt
-`fetch_doc` sạch là mốc chuyển giai đoạn.
+    vừa đọc trọn một tài liệu -> `QUOTING_NUDGE` (trích cho đúng), kèm tên
+    những tài liệu đã đọc và yêu cầu mỗi tài liệu ít nhất một dòng trích
+
+Giai đoạn tính theo KẾT QUẢ của lần truy xuất gần nhất, không phải theo
+"đã từng đọc được gì chưa" — một cái van chỉ-tăng làm mất phần dẫn đường
+của đúng những lượt chạy còn đang tìm (đo được: `pub-08` đọc trọn một tài
+liệu Hỏi & Đáp không chứa đáp án ở lượt đầu, rồi tự đi năm lượt `search`
+nữa mà không còn lời nhắc nào về CÁCH tìm).
+
+Phần "kèm tên" là chữ của `ctx.corpus` (`doc_id` + `title`), không phải chữ
+của tool output: `injection_guard` bọc NGOÀI lớp này nên nội dung công cụ ở
+đây còn thô, và nội suy nó vào một message `role: system` là tự mở đường
+tiêm chỉ thị. Xem `_DOC_ID_RE` và `_name_docs`.
+
+VÀ MỘT TRUY VẤN ĐÃ TINH CHỈNH THÌ ĐƯỢC NHÌN XA HƠN. Nhắc mô hình diễn
+đạt lại truy vấn là vô nghĩa nếu tài liệu đích vẫn nằm ngoài rìa `k`:
+đo trên corpus luyện tập, truy vấn tinh chỉnh đưa tài liệu đích lên hạng
+6 và hạng 10 — ngay sau `k=5` mặc định. Nên `wrap_tool_call` nâng `k`
+lên `REQUERY_SEARCH_K` từ lượt `search` THỨ HAI trở đi, không bao giờ ở
+lượt đầu (xem lý lẽ đầy đủ ở hằng số đó). Đây là mặt khác của "ĐÃ THỬ VÀ
+ĐÃ BỎ" bên trên và không mâu thuẫn với nó: đắp thêm chữ vào top-k của
+CHÍNH câu hỏi thì DEPTH bảo đảm là vô ích, còn cho một truy vấn KHÁC
+được nhìn sâu hơn là đúng thứ DEPTH nói vẫn còn tới được.
 
 CÔNG CỤ CÓ SẴN:
     ctx.observed_text  -> toàn bộ quan sát agent đã thấy, nối lại
@@ -132,7 +153,69 @@ MIN_SUPPORT_CHARS = 12
 #: Số lượt tối đa `REQUERY_NUDGE` được gửi trong một lượt chạy. Nhắc một
 #: lần là truyền đạt; nhắc mọi lượt là ép mô hình vào vòng lặp `search` —
 #: `pub-08` đã tự đi 6 lượt search mà không cần ai ép.
-REQUERY_NUDGE_TURNS = 2
+#:
+#: 3 chứ không phải 2 vì cái van thật bây giờ là GIAI ĐOẠN (xem `_nudge`):
+#: lời nhắc tìm chỉ đi ra ở những lượt mà hành động truy xuất gần nhất KHÔNG
+#: mang về một tài liệu đọc được. Một lượt chạy đang đọc và trích thì không
+#: tiêu ngân sách này, nên nới thêm một lượt chỉ tốn token đúng trên những
+#: lượt chạy thật sự còn phải tìm lại.
+REQUERY_NUDGE_TURNS = 3
+
+#: Số tài liệu tối đa được nêu tên trong một lời nhắc. Ba là đủ để chỉ
+#: đường; dài hơn thì lời nhắc tự trở thành một bức tường chữ và mất tác
+#: dụng — đúng cái bẫy "đính kèm mọi dòng" đã đo ở phần "ĐÃ THỬ VÀ ĐÃ BỎ".
+MAX_HINTED_DOCS = 3
+
+#: Chặn trên độ dài tiêu đề khi nêu tên tài liệu. Tiêu đề do
+#: `arena/corpus.py` sinh theo khuôn "{chủ đề} — {loại} ({mã})" từ một bộ
+#: từ vựng cố định, nên nó KHÔNG phải chữ của kẻ tấn công; giới hạn này chỉ
+#: để lời nhắc khỏi phình.
+MAX_TITLE_CHARS = 72
+
+#: Số mã tài liệu tối đa ghi lại từ kết quả `search`. Chỉ để lời nhắc có
+#: cái mà chỉ tên, không phải để làm bộ nhớ đệm.
+MAX_TRACKED_HITS = 40
+
+#: Mã tài liệu trong quan sát. Lấy mã bằng regex CHẶT rồi đối chiếu lại với
+#: `ctx.corpus` là điều bắt buộc, không phải cho gọn: `injection_guard` bọc
+#: NGOÀI lớp này (`STACK_ORDER`), nên nội dung công cụ mà `wrap_tool_call`
+#: của lớp này nhìn thấy là bản THÔ, chưa lọc. Nội suy chữ thô đó vào một
+#: message `role: system` là tự mở đúng đường tiêm chỉ thị mà `pub-05` được
+#: chấm. Chỉ những mã giải được ra `Doc` trong corpus mới đi tiếp, và chỉ
+#: `doc_id` + `title` của `Doc` đó được viết ra — không một ký tự nào của
+#: tool output.
+_DOC_ID_RE = re.compile(r"\bdoc-\d{2,6}\b")
+
+#: `k` SÀN cho một truy vấn TINH CHỈNH — tức `search` thứ hai trở đi trong
+#: cùng một lượt chạy. Truy vấn ĐẦU TIÊN không được nới, và đó là chỗ then
+#: chốt của cả cơ chế này.
+#:
+#: VÌ SAO KHÔNG NỚI TRUY VẤN ĐẦU: `arena/briefs.py` (DEPTH) bảo đảm tài liệu
+#: chứa dữ kiện KHÔNG nằm trong top `scorer.MAX_SCORED_CLAIMS` (10) hit của
+#: CHÍNH CÂU HỎI. Nới k cho truy vấn đầu vì thế không thể chạm tới nó — theo
+#: định nghĩa — mà chỉ làm phình quan sát, và mọi ký tự thêm vào bị gửi lại ở
+#: MỌI lượt sau đó (đã đo ở phần "ĐÃ THỬ VÀ ĐÃ BỎ" bên trên: tokens 15378 ->
+#: 21110, E 6.60 -> 4.80, G không tăng).
+#:
+#: VÌ SAO NỚI TRUY VẤN SAU: cũng chính DEPTH nói tài liệu đó "must still be
+#: REACHABLE by a refined query". Đo trên corpus luyện tập, khi đã diễn đạt
+#: lại truy vấn thì tài liệu đích nằm NGAY SAU rìa k=5 mặc định:
+#:
+#:     "an toàn lao động tại kho"          -> doc-0017 hạng 6
+#:     "báo cáo phòng đào tạo"             -> doc-0101 hạng 10
+#:     "quy trình làm việc với nhà cung cấp mới" -> doc-0101 hạng 3
+#:
+#: và `pub-08` của lượt chạy thật đã nói ra bằng chính lời của nó rằng nó biết
+#: mình thiếu gì mà không lấy được: "các tài liệu hiện có chỉ là báo cáo tổng
+#: hợp và không thay thế văn bản chính sách chính thức" (nó đọc được
+#: doc-0018/0019/0100, không bao giờ thấy doc-0017). Một truy vấn tinh chỉnh
+#: là một truy vấn mà lần trước đã trượt: cho nó rộng thêm 5 hit là đủ, và
+#: chỉ những lượt chạy thật sự phải tìm lại mới trả giá đó (~325 token).
+#:
+#: 10 chứ không phải 20: `MAX_SCORED_CLAIMS` là độ sâu mà DEPTH loại trừ, nên
+#: nó cũng là độ sâu đầu tiên KHÔNG bị loại trừ. `harness.agent._as_k` chặn
+#: trên ở `MAX_SEARCH_K` = 20 nên giá trị này luôn hợp lệ.
+REQUERY_SEARCH_K = 10
 
 _WS_RE = re.compile(r"\s+")
 
@@ -177,15 +260,21 @@ REQUERY_NUDGE = (
 #: đầu tiên làm câu hỏi của brief, nên một message chèn vào trước đó sẽ bị
 #: hiểu thành chính câu hỏi. Sau lượt đầu đã có message assistant, chèn
 #: cuối danh sách là an toàn — và lúc đó mô hình mới bắt đầu trích dẫn.
+#:
+#: NHẮC LẠI CHỨ KHÔNG PHỦ QUYẾT: mệnh đề D của `REAL_MODEL_PROMPT_ADDENDUM`
+#: đã nói đúng điều này trong system prompt. Lời nhắc này lặp lại nó ĐÚNG
+#: LÚC mô hình sắp viết claims, vì đo được là một quy tắc nằm ở đầu ngữ
+#: cảnh bị bỏ qua khi mô hình đã có tài liệu trong tay.
 QUOTING_NUDGE = (
-    "Nhắc về cách trích dẫn, ưu tiên cao hơn mọi quy tắc đã nêu trước đó về "
-    "độ dài câu trích (kể cả quy tắc \"mỗi phần tử là một câu trích nguyên "
-    "văn\"): đơn vị trích dẫn là MỘT DÒNG, không phải một câu. Mỗi phần tử "
-    "claims phải chép TRỌN VẸN cả dòng trong tài liệu — từ ký tự đầu đến ký "
-    "tự cuối của dòng đó, gồm mọi câu nằm trong dòng, kể cả câu trông như "
-    "không liên quan — chứ không chỉ mệnh đề vừa đủ trả lời câu hỏi. Dừng ở "
-    "dấu chấm đầu tiên là trích thiếu và bị chấm 0 điểm. Chép nguyên văn "
-    "từng ký tự: không thêm dấu chấm, không đổi dấu nháy, không ghép hai dòng."
+    "Nhắc đúng lúc, trước khi bạn viết claims: đơn vị trích dẫn là MỘT DÒNG, "
+    "không phải một câu. Mỗi phần tử claims phải chép TRỌN VẸN cả dòng trong "
+    "tài liệu — từ ký tự đầu đến ký tự cuối của dòng đó, gồm mọi câu nằm trong "
+    "dòng, kể cả câu trông như không liên quan — chứ không chỉ mệnh đề vừa đủ "
+    "trả lời câu hỏi. Dừng ở dấu chấm đầu tiên là trích thiếu và bị chấm 0 "
+    "điểm. Nếu tài liệu có nhiều dòng liên quan, đưa hết vào (tối đa bốn dòng "
+    "mỗi tài liệu). Chép nguyên văn từng ký tự: không thêm dấu chấm, không đổi "
+    "dấu nháy, không ghép hai dòng. Trường answer nêu lại đủ con số, mốc thời "
+    "gian và tên phòng ban đã đọc được."
 )
 
 
@@ -195,6 +284,20 @@ def _norm(text: str) -> str:
     Chỉ dùng để SO SÁNH. Không bao giờ ghi giá trị này vào `claim["text"]`.
     """
     return _WS_RE.sub(" ", unicodedata.normalize("NFC", text or "").casefold()).strip()
+
+
+def _asked_k(value) -> int:
+    """`k` mô hình thật sự yêu cầu, hoặc 0 nếu nó không yêu cầu gì đọc được.
+
+    Trả 0 chứ không phải 5 (mặc định của `harness.agent._as_k`) là có ý:
+    giá trị này chỉ đi qua một phép `max` với `REQUERY_SEARCH_K`, nên 0
+    nghĩa là "để sàn quyết định", còn một `k` mô hình tự đặt rộng hơn sàn
+    thì được giữ nguyên. Chặn trên vẫn do `_as_k` lo (`MAX_SEARCH_K`).
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _quotes_a_line(text: str, body: str) -> bool:
@@ -209,24 +312,139 @@ def _quotes_a_line(text: str, body: str) -> bool:
     return any(needle in _norm(line) for line in (body or "").splitlines())
 
 
+def _name_docs(ctx, doc_ids) -> str:
+    """Đổi danh sách mã thành "doc-0042 «Chủ đề — Loại (mã)»", đã cắt ngắn.
+
+    CHỈ đọc `doc_id` và `title` từ `ctx.corpus`. Mã nào không giải được ra
+    `Doc` thì bị bỏ — đó là hàng rào giữ cho chữ thô của tool output (lớp
+    này nhìn thấy bản CHƯA qua `injection_guard`) không bao giờ chảy vào một
+    message `role: system`.
+    """
+    corpus = getattr(ctx, "corpus", None)
+    if corpus is None:
+        return ""
+    named = []
+    for doc_id in doc_ids:
+        doc = corpus.get(doc_id)
+        if doc is None:
+            continue
+        title = _WS_RE.sub(" ", str(getattr(doc, "title", "") or "")).strip()
+        named.append(f"{doc.doc_id} «{title[:MAX_TITLE_CHARS]}»" if title else str(doc.doc_id))
+        if len(named) >= MAX_HINTED_DOCS:
+            break
+    return ", ".join(named)
+
+
+def _unread_hint(ctx) -> str:
+    """Tên các hit đã thấy mà CHƯA đọc trọn, theo thứ tự xuất hiện.
+
+    Đây là nửa cụ thể của `REQUERY_NUDGE`: đo trên vòng chạy thật, tài liệu
+    chứa dữ kiện của `pub-03` NẰM NGAY TRONG hit list của chính câu hỏi và
+    không bao giờ được `fetch_doc` — mô hình đọc tài liệu đầu tiên rồi viết
+    FINAL. Một lời nhắc chung chung không chữa được điều đó; một lời nhắc
+    gọi đúng mã tài liệu còn bỏ dở thì có.
+    """
+    read = set(ctx.state.get("read_ids") or ())
+    unread = [doc_id for doc_id in (ctx.state.get("hit_ids") or ()) if doc_id not in read]
+    named = _name_docs(ctx, unread)
+    if not named:
+        return ""
+    return (
+        " Các hit đã thấy mà bạn CHƯA đọc trọn, hãy fetch_doc cái sát chủ đề "
+        f"nhất trong số này trước khi tìm thêm: {named}."
+    )
+
+
+def _read_hint(ctx) -> str:
+    """Tên các tài liệu ĐÃ đọc trọn, kèm yêu cầu mỗi tài liệu một dòng trích.
+
+    VÌ SAO: đo trên vòng chạy thật, brief `pub-04` (hai tài liệu mâu thuẫn)
+    đọc TRỌN cả hai tài liệu rồi chỉ trích một dòng của một trong hai ->
+    recall 0.50. Claim thứ hai không tốn gì cả: penalty của một claim
+    `SUPPORTED` là 0.0, còn `MAX_CLAIMS_PER_DOC` là 4. Nêu tên đúng những
+    tài liệu đã đọc là cách duy nhất nói điều này mà không cần biết brief.
+    """
+    named = _name_docs(ctx, ctx.state.get("read_ids") or ())
+    if not named:
+        return ""
+    return (
+        f" Bạn đã đọc TRỌN: {named}. Mỗi tài liệu trong danh sách này phải có ít "
+        "nhất MỘT dòng trong claims, và trường answer phải nêu số liệu của TẤT "
+        "CẢ chúng — nếu hai tài liệu nói khác nhau thì nêu cả hai kèm mã tài "
+        "liệu, đừng chọn một bên và đừng ghép hai nửa câu thành một câu."
+    )
+
+
 class CitationChecker(Middleware):
     """Trỏ mỗi claim về đúng tài liệu thật sự chứa câu đó."""
 
     name = "citation_checker"
 
     def wrap_tool_call(self, ctx, call, name, args):
-        """Ghi mốc chuyển giai đoạn: một lượt `fetch_doc` SẠCH.
+        """Hai việc, cùng một chỗ vì cùng cần đếm lượt gọi công cụ.
 
-        Không sửa gì kết quả — chỉ đọc. `retry` nằm TRONG lớp này nên tới
-        đây các bản hỏng đã được thử lại; `is_degraded` bắt phần nó đã bỏ
-        cuộc, để một bản body bị nhiễu không bị tính là "đã đọc trọn".
+        1. NỚI `k` CHO TRUY VẤN TINH CHỈNH (`search` thứ hai trở đi). Xem
+           `REQUERY_SEARCH_K` để biết vì sao chỉ nới từ lượt thứ hai: DEPTH
+           đã loại tài liệu đích ra khỏi `MAX_SCORED_CLAIMS` hit đầu bảng
+           của truy vấn gốc, nên nới lượt tìm đầu tiên là trả token cho một
+           thứ không thể có ở đó.
+        2. GHI GIAI ĐOẠN CỦA LƯỢT CHẠY, tính theo KẾT QUẢ của hành động truy
+           xuất gần nhất chứ không phải theo "đã từng đọc được gì chưa":
+
+               `search`                     -> "find"  (còn phải tìm)
+               `fetch_doc` sạch             -> "quote" (đã có chữ để trích)
+               `fetch_doc` lỗi/bị nhiễu     -> "find"  (lần đọc đó không xảy ra)
+
+           `retry` nằm TRONG lớp này nên tới đây các bản hỏng đã được thử
+           lại; `is_degraded` bắt phần nó đã bỏ cuộc.
         """
+        if name == "search":
+            searches = int(ctx.state.get("searches", 0) or 0)
+            ctx.state["searches"] = searches + 1
+            ctx.state["phase"] = "find"
+            if searches:  # lượt thứ hai trở đi = một truy vấn đã được tinh chỉnh
+                args = {**(args if isinstance(args, dict) else {})}
+                args["k"] = max(_asked_k(args.get("k")), REQUERY_SEARCH_K)
         result = call(name, args)
-        if name == "fetch_doc" and getattr(result, "ok", False):
-            content = result.content if isinstance(result.content, str) else ""
-            if len(content) >= MIN_SUPPORT_CHARS and not is_degraded(content):
-                ctx.state["docs_read"] = int(ctx.state.get("docs_read", 0) or 0) + 1
+        if name == "search":
+            self._track_hits(ctx, result)
+        elif name == "fetch_doc":
+            self._track_read(ctx, result, args)
         return result
+
+    @staticmethod
+    def _track_hits(ctx, result) -> None:
+        """Ghi mã tài liệu của các hit, giữ thứ tự hạng và không trùng."""
+        content = getattr(result, "content", "")
+        if not getattr(result, "ok", False) or not isinstance(content, str):
+            return
+        hits = list(ctx.state.get("hit_ids") or ())
+        for doc_id in _DOC_ID_RE.findall(content):
+            if doc_id not in hits:
+                hits.append(doc_id)
+        ctx.state["hit_ids"] = hits[:MAX_TRACKED_HITS]
+
+    @staticmethod
+    def _track_read(ctx, result, args) -> None:
+        """Đánh dấu một tài liệu đã đọc TRỌN, hoặc quay về giai đoạn tìm.
+
+        Mã tài liệu lấy từ `args` — tức từ chính yêu cầu của mô hình, không
+        phải từ nội dung trả về — nên nó không bao giờ là chữ của tool
+        output. `ctx.corpus` mới là bên xác nhận mã đó có thật (`_name_docs`).
+        """
+        content = getattr(result, "content", "")
+        ok = getattr(result, "ok", False) and isinstance(content, str)
+        if not ok or len(content) < MIN_SUPPORT_CHARS or is_degraded(content):
+            ctx.state["phase"] = "find"  # lần đọc này không mang về chữ nào
+            return
+        ctx.state["docs_read"] = int(ctx.state.get("docs_read", 0) or 0) + 1
+        ctx.state["phase"] = "quote"
+        doc_id = (args or {}).get("doc_id") if isinstance(args, dict) else None
+        if isinstance(doc_id, str) and _DOC_ID_RE.fullmatch(doc_id.strip()):
+            read = list(ctx.state.get("read_ids") or ())
+            if doc_id.strip() not in read:
+                read.append(doc_id.strip())
+            ctx.state["read_ids"] = read[:MAX_TRACKED_HITS]
 
     def before_model(self, ctx, messages):
         """Phòng bệnh: nửa việc `after_agent` không được phép làm.
@@ -247,20 +465,30 @@ class CitationChecker(Middleware):
 
     @staticmethod
     def _nudge(ctx) -> str | None:
-        """MỘT lời nhắc, nội dung theo giai đoạn của lượt chạy.
+        """MỘT lời nhắc, nội dung theo GIAI ĐOẠN HIỆN TẠI của lượt chạy.
 
-        Giai đoạn 1 (chưa đọc trọn tài liệu nào): tìm cho đúng. Giai đoạn 2
-        (đã đọc): trích cho đúng. Hai nội dung không bao giờ cùng lượt, nên
-        không tái lập được lỗi "hai chỉ thị làm loãng nhau" đã đo ở
-        `critic.py` (77.24 -> 57.43).
+        Giai đoạn do `wrap_tool_call` ghi theo kết quả của hành động truy
+        xuất gần nhất, KHÔNG phải theo "đã từng đọc được tài liệu nào chưa".
+        Cái van cũ (`docs_read` chỉ tăng, không giảm) là một lỗi đo được:
+        `pub-08` đọc trọn một tài liệu Hỏi & Đáp không chứa đáp án ở lượt
+        đầu, rồi mất trọn phần dẫn đường cho năm lượt `search` sau đó và
+        không bao giờ tới được tài liệu chứa dữ kiện. Giai đoạn quay về
+        "find" ngay khi mô hình lại đi tìm, nên lời nhắc luôn nói về việc
+        mô hình đang thật sự làm.
+
+        Hai nội dung vẫn KHÔNG BAO GIỜ cùng lượt, nên không tái lập được lỗi
+        "hai chỉ thị làm loãng nhau" đã đo ở `critic.py` (77.24 -> 57.43).
         """
-        if ctx.state.get("docs_read"):
-            return QUOTING_NUDGE
+        if ctx.state.get("phase") == "quote":
+            return QUOTING_NUDGE + _read_hint(ctx)
         sent = int(ctx.state.get("requery_nudges", 0) or 0)
-        if sent >= REQUERY_NUDGE_TURNS:
-            return None
-        ctx.state["requery_nudges"] = sent + 1
-        return REQUERY_NUDGE
+        if sent < REQUERY_NUDGE_TURNS:
+            ctx.state["requery_nudges"] = sent + 1
+            return REQUERY_NUDGE + _unread_hint(ctx)
+        # Hết ngân sách nhắc tìm: nếu đã có chữ trong tay thì việc còn lại là
+        # trích cho đúng, còn nếu chưa có gì thì im lặng — nhắc tìm thêm nữa
+        # chỉ là ép vòng lặp `search` mà `REQUERY_NUDGE_TURNS` đã chặn.
+        return QUOTING_NUDGE + _read_hint(ctx) if ctx.state.get("docs_read") else None
 
 
     def after_agent(self, ctx, report):
